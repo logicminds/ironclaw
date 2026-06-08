@@ -29,7 +29,7 @@ use exports::near::agent::channel::{
     AgentResponse, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
     OutgoingHttpResponse, StatusUpdate,
 };
-use near::agent::channel_host::{self, EmittedMessage};
+use near::agent::channel_host::{self, EmittedMessage, InboundAttachment};
 
 /// Slack event wrapper.
 #[derive(Debug, Deserialize)]
@@ -78,6 +78,28 @@ struct SlackEvent {
 
     /// Subtype (bot_message, etc.)
     subtype: Option<String>,
+
+    /// File attachments.
+    files: Option<Vec<SlackFile>>,
+}
+
+/// A file attached to a Slack message.
+#[derive(Debug, Deserialize)]
+struct SlackFile {
+    /// Unique file identifier.
+    id: Option<String>,
+
+    /// Original filename.
+    name: Option<String>,
+
+    /// MIME type (e.g., "image/png").
+    mimetype: Option<String>,
+
+    /// File size in bytes.
+    size: Option<u64>,
+
+    /// Private download URL (requires auth, returns 302 to CDN).
+    url_private: Option<String>,
 }
 
 /// Metadata stored with emitted messages for response routing.
@@ -312,7 +334,137 @@ impl Guest for SlackChannel {
 }
 
 /// Handle a Slack event and emit message if applicable.
+/// Maximum number of HTTP redirects to follow when downloading files.
+const MAX_REDIRECTS: u8 = 5;
+
+/// Perform a GET request, following 3xx redirects up to MAX_REDIRECTS hops.
+///
+/// Slack's `url_private` returns a 302 to a presigned CDN URL. The redirect
+/// target does not require authentication (it's a presigned S3/CDN link), so
+/// we issue a plain GET without any Authorization header on subsequent hops.
+fn http_get_follow_redirects(url: &str) -> Result<channel_host::HttpResponse, String> {
+    let mut current_url = url.to_string();
+    for _ in 0..MAX_REDIRECTS {
+        let resp = channel_host::http_request("GET", &current_url, "{}", None, Some(30000))?;
+        match resp.status {
+            301 | 302 | 307 | 308 => {
+                let headers: serde_json::Value =
+                    serde_json::from_str(&resp.headers_json).unwrap_or_default();
+                let location = headers
+                    .get("location")
+                    .or_else(|| headers.get("Location"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Redirect response missing Location header".to_string())?;
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    &format!("Following redirect -> {}", &location[..location.len().min(80)]),
+                );
+                current_url = location.to_string();
+            }
+            _ => return Ok(resp),
+        }
+    }
+    Err(format!("Too many redirects (>{}) for {}", MAX_REDIRECTS, url))
+}
+
+/// Download file attachments from a Slack event, following redirects.
+///
+/// Returns a list of `InboundAttachment` records with the binary data stored
+/// via `store_attachment_data`. Files that fail to download are still included
+/// in the list (with no storage_key) so the agent knows they were attached.
+fn download_attachments(files: &[SlackFile]) -> Vec<InboundAttachment> {
+    let mut attachments = Vec::new();
+
+    for file in files {
+        let file_id = file.id.as_deref().unwrap_or("unknown");
+        let filename = file.name.clone().unwrap_or_else(|| "attachment".to_string());
+        let mime_type = file
+            .mimetype
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        let url = match &file.url_private {
+            Some(u) => u,
+            None => {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("File {} has no url_private, skipping download", file_id),
+                );
+                continue;
+            }
+        };
+
+        channel_host::log(
+            channel_host::LogLevel::Info,
+            &format!("Downloading file: {} ({})", filename, file_id),
+        );
+
+        match http_get_follow_redirects(url) {
+            Ok(resp) if resp.status == 200 && !resp.body.is_empty() => {
+                let att_id = format!("slack-{}", file_id);
+                channel_host::log(
+                    channel_host::LogLevel::Info,
+                    &format!("Downloaded {} ({} bytes)", filename, resp.body.len()),
+                );
+                if let Err(e) = channel_host::store_attachment_data(&att_id, &resp.body) {
+                    channel_host::log(
+                        channel_host::LogLevel::Error,
+                        &format!("store_attachment_data failed for {}: {}", att_id, e),
+                    );
+                }
+                attachments.push(InboundAttachment {
+                    id: att_id,
+                    mime_type,
+                    filename: Some(filename),
+                    size_bytes: file.size,
+                    source_url: Some(url.clone()),
+                    storage_key: None,
+                    extracted_text: None,
+                    extras_json: "{}".to_string(),
+                });
+            }
+            Ok(resp) => {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!(
+                        "File download failed for {}: status={}, body_len={}",
+                        filename,
+                        resp.status,
+                        resp.body.len()
+                    ),
+                );
+                // Include metadata even if download failed
+                attachments.push(InboundAttachment {
+                    id: format!("slack-{}", file_id),
+                    mime_type,
+                    filename: Some(filename),
+                    size_bytes: file.size,
+                    source_url: Some(url.clone()),
+                    storage_key: None,
+                    extracted_text: None,
+                    extras_json: "{}".to_string(),
+                });
+            }
+            Err(e) => {
+                channel_host::log(
+                    channel_host::LogLevel::Error,
+                    &format!("File download error for {}: {}", filename, e),
+                );
+            }
+        }
+    }
+
+    attachments
+}
+
 fn handle_slack_event(event: SlackEvent, team_id: Option<String>, _event_id: Option<String>) {
+    // Download file attachments (if any) before consuming the event fields
+    let attachments = event
+        .files
+        .as_deref()
+        .map(download_attachments)
+        .unwrap_or_default();
+
     match event.event_type.as_str() {
         // Direct mention of the bot (always in a channel, not a DM)
         "app_mention" => {
@@ -326,7 +478,7 @@ fn handle_slack_event(event: SlackEvent, team_id: Option<String>, _event_id: Opt
                 if !check_sender_permission(&user, &channel, false) {
                     return;
                 }
-                emit_message(user, text, channel, event.thread_ts.or(Some(ts)), team_id);
+                emit_message(user, text, channel, event.thread_ts.or(Some(ts)), team_id, attachments);
             }
         }
 
@@ -348,7 +500,7 @@ fn handle_slack_event(event: SlackEvent, team_id: Option<String>, _event_id: Opt
                     if !check_sender_permission(&user, &channel, true) {
                         return;
                     }
-                    emit_message(user, text, channel, event.thread_ts.or(Some(ts)), team_id);
+                    emit_message(user, text, channel, event.thread_ts.or(Some(ts)), team_id, attachments);
                 }
             }
         }
@@ -369,6 +521,7 @@ fn emit_message(
     channel: String,
     thread_ts: Option<String>,
     team_id: Option<String>,
+    attachments: Vec<InboundAttachment>,
 ) {
     let message_ts = thread_ts.clone().unwrap_or_default();
 
@@ -396,6 +549,7 @@ fn emit_message(
         content: cleaned_text,
         thread_id: thread_ts,
         metadata_json,
+        attachments,
     });
 }
 
